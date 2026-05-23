@@ -1,0 +1,15 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime logs and process files
+*.requests.jsonl
+*.upstream.jsonl
+*.pid
+*.out.log
+
+# Dependency and tooling caches
+node_modules/
+.DS_Store
+Thumbs.db
