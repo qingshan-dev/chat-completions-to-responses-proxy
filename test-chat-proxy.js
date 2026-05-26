@@ -92,16 +92,39 @@ async function runSmokeCase({ name, upstreamApiKey, expectedUpstreamAuthHeader }
 
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "chat-proxy-test-"));
   let upstreamRequestBody;
-  let upstreamAuthHeader;
+  let upstreamResponsesAuthHeader;
+  let upstreamModelsAuthHeader;
+  let upstreamModelsRequestCount = 0;
 
   const upstreamServer = http.createServer(async (req, res) => {
+    if (req.method === "GET" && req.url === "/v1/models") {
+      upstreamModelsRequestCount += 1;
+      upstreamModelsAuthHeader = req.headers.authorization;
+      const id = `mock-model-${upstreamModelsRequestCount}`;
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(
+        JSON.stringify({
+          object: "list",
+          data: [
+            {
+              id,
+              object: "model",
+              created: 123,
+              owned_by: "mock-owner",
+            },
+          ],
+        }),
+      );
+      return;
+    }
+
     if (req.method !== "POST" || req.url !== "/v1/responses") {
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "not found" }));
       return;
     }
 
-    upstreamAuthHeader = req.headers.authorization;
+    upstreamResponsesAuthHeader = req.headers.authorization;
     upstreamRequestBody = JSON.parse(await readBody(req));
 
     res.writeHead(200, {
@@ -200,7 +223,64 @@ async function runSmokeCase({ name, upstreamApiKey, expectedUpstreamAuthHeader }
       total_tokens: 6,
     });
 
-    assert.equal(upstreamAuthHeader, expectedUpstreamAuthHeader);
+    const models = await requestJson({
+      method: "GET",
+      port: proxyAddress.port,
+      path: "/v1/models",
+      headers: { Authorization: "Bearer test-local-key" },
+    });
+    assert.equal(models.statusCode, 200);
+    assert.deepEqual(models.body, {
+      object: "list",
+      data: [
+        {
+          id: "mock-model-1",
+          object: "model",
+          created: 123,
+          owned_by: "mock-owner",
+        },
+      ],
+    });
+
+    const uncachedModels = await requestJson({
+      method: "GET",
+      port: proxyAddress.port,
+      path: "/v1/models",
+      headers: { Authorization: "Bearer test-local-key" },
+    });
+    assert.equal(uncachedModels.statusCode, 200);
+    assert.deepEqual(uncachedModels.body, {
+      object: "list",
+      data: [
+        {
+          id: "mock-model-2",
+          object: "model",
+          created: 123,
+          owned_by: "mock-owner",
+        },
+      ],
+    });
+    assert.equal(upstreamModelsRequestCount, 2);
+
+    const usage = await requestJson({
+      method: "GET",
+      port: proxyAddress.port,
+      path: "/v1/usage",
+      headers: { Authorization: "Bearer test-local-key" },
+    });
+    assert.equal(usage.statusCode, 200);
+    assert.deepEqual(usage.body, {
+      object: "proxy.usage",
+      cumulative_usage: {
+        request_count: 1,
+        prompt_tokens: 5,
+        completion_tokens: 1,
+        total_tokens: 6,
+      },
+    });
+
+    assert.equal(upstreamResponsesAuthHeader, expectedUpstreamAuthHeader);
+    assert.equal(upstreamModelsAuthHeader, expectedUpstreamAuthHeader);
     assert.equal(upstreamRequestBody.model, "mock-model");
     assert.equal(upstreamRequestBody.stream, true);
     assert.equal(upstreamRequestBody.instructions, "Be concise.");
@@ -208,6 +288,215 @@ async function runSmokeCase({ name, upstreamApiKey, expectedUpstreamAuthHeader }
     assert.equal(upstreamRequestBody.input[0].content[0].text, "ping");
 
     console.log(`ok - ${name}`);
+  } catch (error) {
+    console.error(stdout.trim());
+    console.error(stderr.trim());
+    throw error;
+  } finally {
+    child.kill();
+    await closeServer(upstreamServer);
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function runCodexModelsClientVersionCase() {
+  await fs.access(PROXY_SCRIPT);
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "chat-proxy-test-"));
+  let upstreamModelsUrl;
+
+  const upstreamServer = http.createServer(async (req, res) => {
+    if (req.method === "GET" && req.url.startsWith("/v1/models")) {
+      upstreamModelsUrl = req.url;
+      const url = new URL(req.url, "http://127.0.0.1");
+      if (url.searchParams.get("client_version") !== "test-client-version") {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ detail: "client_version is required" }));
+        return;
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(
+        JSON.stringify({
+          object: "list",
+          models: [
+            {
+              slug: "codex-model",
+              created: 456,
+              owned_by: "codex-owner",
+            },
+          ],
+        }),
+      );
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/v1/responses") {
+      await readBody(req);
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "x-codex-active-limit": "premium",
+        "x-codex-plan-type": "plus",
+        "x-codex-primary-used-percent": "12",
+        "x-codex-secondary-used-percent": "34",
+        "x-codex-primary-window-minutes": "300",
+        "x-codex-secondary-window-minutes": "10080",
+        "x-codex-primary-reset-after-seconds": "120",
+        "x-codex-secondary-reset-after-seconds": "240",
+        "x-codex-primary-reset-at": "1700000120",
+        "x-codex-secondary-reset-at": "1700000240",
+        "x-codex-credits-has-credits": "False",
+        "x-codex-credits-balance": "",
+        "x-codex-credits-unlimited": "False",
+      });
+      res.write(
+        `data: ${JSON.stringify({
+          type: "response.output_text.delta",
+          delta: "ok",
+        })}\n\n`,
+      );
+      res.write(
+        `data: ${JSON.stringify({
+          type: "response.completed",
+          response: {
+            model: "codex-model",
+            usage: {
+              input_tokens: 7,
+              output_tokens: 2,
+              total_tokens: 9,
+            },
+          },
+        })}\n\n`,
+      );
+      res.end();
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "not found" }));
+  });
+
+  const upstreamAddress = await listen(upstreamServer);
+  const proxyProbe = http.createServer((_, res) => res.end("reserved"));
+  const proxyAddress = await listen(proxyProbe);
+  await closeServer(proxyProbe);
+
+  const child = spawn(process.execPath, [PROXY_SCRIPT], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      PORT: String(proxyAddress.port),
+      HOST: "127.0.0.1",
+      UPSTREAM_MODE: "codex",
+      UPSTREAM_RESPONSES_URL: `http://127.0.0.1:${upstreamAddress.port}/v1/responses`,
+      CODEX_ACCESS_TOKEN: "test-token",
+      CODEX_ACCOUNT_ID: "test-account",
+      CODEX_CLIENT_VERSION: "test-client-version",
+      LOCAL_API_KEY: "test-local-key",
+      LOG_FILE: path.join(tempDir, "requests.jsonl"),
+      RAW_LOG_FILE: path.join(tempDir, "upstream.jsonl"),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk.toString("utf8");
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk.toString("utf8");
+  });
+
+  try {
+    const health = await waitForHealth(proxyAddress.port, child);
+    assert.equal(health.upstream_mode, "codex");
+
+    const models = await requestJson({
+      method: "GET",
+      port: proxyAddress.port,
+      path: "/v1/models",
+      headers: { Authorization: "Bearer test-local-key" },
+    });
+
+    assert.equal(models.statusCode, 200);
+    assert.deepEqual(models.body, {
+      object: "list",
+      data: [
+        {
+          id: "codex-model",
+          object: "model",
+          created: 456,
+          owned_by: "codex-owner",
+        },
+      ],
+    });
+    assert.equal(
+      upstreamModelsUrl,
+      "/v1/models?client_version=test-client-version",
+    );
+
+    const chat = await requestJson({
+      method: "POST",
+      port: proxyAddress.port,
+      path: "/v1/chat/completions",
+      headers: { Authorization: "Bearer test-local-key" },
+      body: {
+        model: "codex-model",
+        stream: false,
+        messages: [{ role: "user", content: "ping" }],
+      },
+    });
+    assert.equal(chat.statusCode, 200);
+    assert.deepEqual(chat.body.usage, {
+      prompt_tokens: 7,
+      completion_tokens: 2,
+      total_tokens: 9,
+    });
+
+    const usage = await requestJson({
+      method: "GET",
+      port: proxyAddress.port,
+      path: "/v1/usage",
+      headers: { Authorization: "Bearer test-local-key" },
+    });
+    assert.equal(usage.statusCode, 200);
+    assert.deepEqual(usage.body, {
+      object: "proxy.usage",
+      cumulative_usage: {
+        request_count: 1,
+        prompt_tokens: 7,
+        completion_tokens: 2,
+        total_tokens: 9,
+      },
+      codex: {
+        rate_limits: {
+          limit_id: "codex",
+          active_limit: "premium",
+          plan_type: "plus",
+          primary: {
+            used_percent: 12,
+            window_minutes: 300,
+            reset_after_seconds: 120,
+            resets_at: 1700000120,
+          },
+          secondary: {
+            used_percent: 34,
+            window_minutes: 10080,
+            reset_after_seconds: 240,
+            resets_at: 1700000240,
+          },
+          credits: {
+            has_credits: false,
+            balance: null,
+            unlimited: false,
+          },
+        },
+      },
+    });
+
+    console.log("ok - codex /v1/models forwards client_version");
   } catch (error) {
     console.error(stdout.trim());
     console.error(stderr.trim());
@@ -231,6 +520,8 @@ async function main() {
     upstreamApiKey: "",
     expectedUpstreamAuthHeader: undefined,
   });
+
+  await runCodexModelsClientVersionCase();
 }
 
 main().catch((error) => {

@@ -68,22 +68,41 @@ fi
 
 eval "$("$node_bin" - "$codex_auth_file" <<'NODE'
 const fs = require("node:fs");
+const path = require("node:path");
 const authFile = process.argv[2];
 const auth = JSON.parse(fs.readFileSync(authFile, "utf8"));
 const tokens = auth.tokens || {};
 if (!tokens.access_token) throw new Error(`Codex auth file has no access_token: ${authFile}`);
 if (!tokens.account_id) throw new Error(`Codex auth file has no account_id: ${authFile}`);
+let clientVersion = "";
+try {
+  const modelsCacheFile = path.join(path.dirname(authFile), "models_cache.json");
+  const modelsCache = JSON.parse(fs.readFileSync(modelsCacheFile, "utf8"));
+  clientVersion = modelsCache.client_version || "";
+} catch {}
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 console.log(`codex_access_token=${shellQuote(tokens.access_token)}`);
 console.log(`codex_account_id=${shellQuote(tokens.account_id)}`);
 console.log(`codex_client_id=${shellQuote(tokens.id_token || "")}`);
+console.log(`codex_client_version=${shellQuote(clientVersion)}`);
 NODE
 )"
 
 if [[ -n "${CODEX_CLIENT_ID:-}" ]]; then
   codex_client_id="$CODEX_CLIENT_ID"
+fi
+
+if [[ -n "${CODEX_CLIENT_VERSION:-}" ]]; then
+  codex_client_version="$CODEX_CLIENT_VERSION"
+fi
+
+if [[ -z "$codex_client_version" ]] && command -v codex >/dev/null 2>&1; then
+  version_text="$(codex --version 2>/dev/null || true)"
+  if [[ "$version_text" =~ ([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?) ]]; then
+    codex_client_version="${BASH_REMATCH[1]}"
+  fi
 fi
 
 listener_pid() {
@@ -108,6 +127,7 @@ if [[ -n "$existing_pid" ]]; then
   printf 'pid: %s\n' "$existing_pid"
   printf 'health: %s\n' "$(health_json)"
   printf 'auth_file: %s\n' "$codex_auth_file"
+  printf 'codex_client_version: %s\n' "$codex_client_version"
   printf 'log_file: %s\n' "$request_log"
   exit 0
 fi
@@ -120,6 +140,7 @@ env_args=(
   CODEX_ACCESS_TOKEN="$codex_access_token"
   CODEX_ACCOUNT_ID="$codex_account_id"
   CODEX_CLIENT_ID="$codex_client_id"
+  CODEX_CLIENT_VERSION="$codex_client_version"
   CODEX_STRICT="1"
   LOCAL_API_KEY="$local_api_key"
   LOG_FILE="$request_log"
@@ -160,6 +181,7 @@ printf 'status: started\n'
 printf 'pid: %s\n' "$proxy_pid"
 printf 'health: %s\n' "$health"
 printf 'auth_file: %s\n' "$codex_auth_file"
+printf 'codex_client_version: %s\n' "$codex_client_version"
 printf 'proxy_url: %s\n' "$proxy_url"
 printf 'log_file: %s\n' "$request_log"
 printf 'raw_log_file: %s\n' "$raw_log"

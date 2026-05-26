@@ -9,6 +9,7 @@ $ErrorActionPreference = 'Stop'
 $WorkDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProxyScript = Join-Path $WorkDir 'chat-completions-to-responses-proxy.js'
 $RequestLog = Join-Path $WorkDir 'chat-completions-to-responses-proxy.requests.jsonl'
+$RawLog = Join-Path $WorkDir 'chat-completions-to-responses-proxy.upstream.jsonl'
 $PidFile = Join-Path $WorkDir 'chat-proxy.pid'
 
 # Local startup parameters. Fill UpstreamApiKey only if your upstream requires it.
@@ -29,6 +30,7 @@ if (-not $env:UPSTREAM_RESPONSES_URL) {
   $env:UPSTREAM_RESPONSES_URL = 'http://127.0.0.1:3000/v1/responses'
 }
 $env:LOG_FILE = $RequestLog
+$env:RAW_LOG_FILE = $RawLog
 
 function Get-ProxyListener {
   netstat -ano |
@@ -71,6 +73,7 @@ if ($listener) {
     health_ok = $health.ok
     upstream_mode = $health.upstream_mode
     log_file = $RequestLog
+    raw_log_file = $RawLog
   } | Format-List
   return
 }
@@ -115,5 +118,6 @@ $listener = Get-ProxyListener
   health_ok = $health.ok
   upstream_mode = $health.upstream_mode
   log_file = $RequestLog
+  raw_log_file = $RawLog
   pid_file = $PidFile
 } | Format-List

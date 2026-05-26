@@ -1,10 +1,17 @@
 # Chat Completions to Responses Proxy
 
-一个本地兼容代理：对外提供 OpenAI 风格的 `/v1/chat/completions`，内部把请求转换成 Responses API 请求，再把 Responses 的流式事件整理回 Chat Completions 响应。
+一个本地兼容代理：对外提供 OpenAI 风格的 `/v1/chat/completions`，并额外提供 `/v1/models` 与 `/v1/usage`；内部把 Chat Completions 请求转换成 Responses API 请求，再把 Responses 的流式事件整理回 Chat Completions 响应。
 
 ## 重要注意事项
 
-本项目只代理 `/v1/chat/completions`。它不会代理 `/v1/responses`、`/v1/models`、`/v1/embeddings` 或其他 OpenAI API 路径。
+本项目目前提供以下本地接口：
+
+- `POST /v1/chat/completions`: 主转换链路，转发到上游 `/v1/responses`
+- `GET /v1/models`: 返回上游模型列表；如果上游不可用则返回内置兜底模型
+- `GET /v1/usage`: 返回本代理进程累计的 token 用量统计
+- `GET /health`: 健康检查
+
+它不会代理 `/v1/responses`、`/v1/embeddings` 或其他 OpenAI API 路径。
 
 默认启动脚本只监听 `127.0.0.1`。如果你显式改成 `0.0.0.0` 或 `::`，必须设置 `LOCAL_API_KEY`，否则脚本会拒绝启动。
 
@@ -147,7 +154,7 @@ Content-Type: application/json
 Accept: text/event-stream
 ```
 
-Codex 模式支持从 JWT access token 中自动提取 `account_id`（如果未显式设置），并在收到 401/403 错误时自动尝试刷新 token 重试一次。
+Codex 模式支持从 JWT access token 中自动提取 `account_id`（如果未显式设置）。如果运行时显式提供了 `CODEX_REFRESH_TOKEN`，代理在收到 401/403 错误时会自动尝试刷新 token 并重试一次；仓库内置的 Codex 启动脚本默认故意不传入 refresh token，因此默认启动方式不会启用这条自动刷新路径。
 
 ## 环境要求
 
@@ -160,7 +167,7 @@ chmod +x ./start-chat-proxy.local.sh ./start-chat-proxy-codex.local.sh ./test-ch
 
 ## 先跑测试
 
-这个测试会临时启动一个假的 Responses 上游和本代理，验证 `/health`、本地鉴权、`/v1/chat/completions` 到 `/v1/responses` 的转换链路。
+这个测试会临时启动一个假的 Responses 上游和本代理，验证 `/health`、本地鉴权、`/v1/chat/completions` 到 `/v1/responses` 的转换链路，以及 `/v1/models`、`/v1/usage` 的本地接口行为。
 
 ```bash
 node ./test-chat-proxy.js
@@ -215,7 +222,16 @@ export UPSTREAM_API_KEY='sk-...'
 启动后默认监听：
 
 ```text
+http://127.0.0.1:8787
+```
+
+可用接口示例：
+
+```text
 http://127.0.0.1:8787/v1/chat/completions
+http://127.0.0.1:8787/v1/models
+http://127.0.0.1:8787/v1/usage
+http://127.0.0.1:8787/health
 ```
 
 如果设置了 `LOCAL_API_KEY`，调用本地代理时也要带：
@@ -225,6 +241,20 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer local-dev-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4.1-mini","messages":[{"role":"user","content":"ping"}]}'
+```
+
+查询模型列表示例：
+
+```bash
+curl http://127.0.0.1:8787/v1/models \
+  -H "Authorization: Bearer local-dev-key"
+```
+
+查询本地累计用量示例：
+
+```bash
+curl http://127.0.0.1:8787/v1/usage \
+  -H "Authorization: Bearer local-dev-key"
 ```
 
 ## Codex 上游模式
@@ -283,7 +313,9 @@ export CODEX_CLIENT_ID=''
 - `LOCAL_API_KEY`: 本地代理鉴权 key，可选。
 - `UPSTREAM_MODE`: `responses` 或 `codex`。
 - `UPSTREAM_RESPONSES_URL`: 上游 Responses endpoint。
+- `UPSTREAM_MODELS_URL`: 可选；显式指定上游模型列表 endpoint。不填时会根据 `UPSTREAM_RESPONSES_URL` 自动推导。
 - `UPSTREAM_API_KEY`: 普通 Responses 上游模式的鉴权 key，可留空。
+- `REQUEST_TIMEOUT_MS`: 上游请求超时，默认 `120000` 毫秒。
 - `CODEX_CLIENT_ID`: Codex 上游模式的客户端 ID 覆盖项，可留空。
 - `PROXY_URL`: 上游请求使用的 HTTP/HTTPS/SOCKS5 代理。
 - `LOG_FILE`: 请求转换日志。
@@ -297,8 +329,19 @@ export CODEX_CLIENT_ID=''
 - `chat-completions-to-responses-proxy.upstream.jsonl`
 - `chat-completions-to-codex-proxy.requests.jsonl`
 - `chat-completions-to-codex-proxy.upstream.jsonl`
+- `chat-proxy.out.log`
+- `chat-proxy-codex.out.log`
 - `chat-proxy.pid`
 - `chat-proxy-codex.pid`
+
+普通模式与 Codex 模式的 PowerShell 启动脚本现在都会输出 `log_file` 与 `raw_log_file`；Bash 脚本还会额外输出 `stdout_log`。
+
+其中：
+
+- `*.requests.jsonl` 记录转换后的请求与输出摘要
+- `*.upstream.jsonl` 记录上游原始响应摘要
+- `*.out.log` 是 Bash 启动脚本写入的 Node stdout/stderr 合并日志
+- `*.pid` 记录启动脚本写入的代理进程 PID
 
 这些文件通常属于本地运行产物，不建议提交到版本库。
 

@@ -24,6 +24,7 @@ const config = {
   codexRefreshToken: process.env.CODEX_REFRESH_TOKEN || "",
   codexAccountId: process.env.CODEX_ACCOUNT_ID || "",
   codexClientId: process.env.CODEX_CLIENT_ID || "",
+  codexClientVersion: process.env.CODEX_CLIENT_VERSION || "",
   proxyUrl: process.env.PROXY_URL || "",
   requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS || 120000),
   codexStrict: process.env.CODEX_STRICT !== "0",
@@ -40,6 +41,10 @@ const cumulativeUsage = {
   prompt_tokens: 0,
   completion_tokens: 0,
   total_tokens: 0,
+};
+
+const codexUsage = {
+  rate_limits: null,
 };
 
 function sendJson(res, statusCode, payload, extraHeaders = {}) {
@@ -296,7 +301,7 @@ function chatToResponsesBody(chatReq) {
   }
 
   if (config.upstreamMode === "codex" && config.codexStrict) {
-    responsesReq.instructions ||= "";
+    responsesReq.instructions = responsesReq.instructions || "";
     responsesReq.store = false;
     delete responsesReq.max_output_tokens;
     delete responsesReq.temperature;
@@ -423,17 +428,17 @@ async function connectSocks5(proxy, target) {
   return socket;
 }
 
+let _socketReadBuffer = Buffer.alloc(0);
+
 function readSocketBytes(socket, count) {
   return new Promise((resolve, reject) => {
-    let buf = Buffer.alloc(0);
     const onData = (chunk) => {
-      buf = Buffer.concat([buf, chunk]);
-      if (buf.length >= count) {
+      _socketReadBuffer = Buffer.concat([_socketReadBuffer, chunk]);
+      if (_socketReadBuffer.length >= count) {
         socket.off("data", onData);
         socket.off("error", onError);
-        const wanted = buf.subarray(0, count);
-        const rest = buf.subarray(count);
-        if (rest.length) socket.unshift(rest);
+        const wanted = _socketReadBuffer.subarray(0, count);
+        _socketReadBuffer = _socketReadBuffer.subarray(count);
         resolve(wanted);
       }
     };
@@ -632,6 +637,7 @@ async function callResponsesUpstream(responsesReq, retryOnUnauthorized = true) {
     },
     body,
   });
+  updateCodexUsageFromHeaders(res.headers);
 
   if (
     retryOnUnauthorized &&
@@ -852,6 +858,77 @@ function normalizeUsage(usage) {
     completion_tokens: Number(usage?.completion_tokens || 0),
     total_tokens: Number(usage?.total_tokens || 0),
   };
+}
+
+function parseNumberHeader(headers, name) {
+  const value = headers[name];
+  if (value == null || value === "") return null;
+  const number = Number(Array.isArray(value) ? value[0] : value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function parseBooleanHeader(headers, name) {
+  const value = headers[name];
+  if (value == null || value === "") return null;
+  const text = String(Array.isArray(value) ? value[0] : value).toLowerCase();
+  if (text === "true") return true;
+  if (text === "false") return false;
+  return null;
+}
+
+function parseStringHeader(headers, name) {
+  const value = headers[name];
+  if (value == null || value === "") return null;
+  return String(Array.isArray(value) ? value[0] : value);
+}
+
+function extractCodexRateLimits(headers) {
+  const primaryUsed = parseNumberHeader(headers, "x-codex-primary-used-percent");
+  const secondaryUsed = parseNumberHeader(
+    headers,
+    "x-codex-secondary-used-percent",
+  );
+  if (primaryUsed == null && secondaryUsed == null) return null;
+  return {
+    limit_id: "codex",
+    active_limit: parseStringHeader(headers, "x-codex-active-limit"),
+    plan_type: parseStringHeader(headers, "x-codex-plan-type"),
+    primary: {
+      used_percent: primaryUsed,
+      window_minutes: parseNumberHeader(
+        headers,
+        "x-codex-primary-window-minutes",
+      ),
+      reset_after_seconds: parseNumberHeader(
+        headers,
+        "x-codex-primary-reset-after-seconds",
+      ),
+      resets_at: parseNumberHeader(headers, "x-codex-primary-reset-at"),
+    },
+    secondary: {
+      used_percent: secondaryUsed,
+      window_minutes: parseNumberHeader(
+        headers,
+        "x-codex-secondary-window-minutes",
+      ),
+      reset_after_seconds: parseNumberHeader(
+        headers,
+        "x-codex-secondary-reset-after-seconds",
+      ),
+      resets_at: parseNumberHeader(headers, "x-codex-secondary-reset-at"),
+    },
+    credits: {
+      has_credits: parseBooleanHeader(headers, "x-codex-credits-has-credits"),
+      balance: parseStringHeader(headers, "x-codex-credits-balance"),
+      unlimited: parseBooleanHeader(headers, "x-codex-credits-unlimited"),
+    },
+  };
+}
+
+function updateCodexUsageFromHeaders(headers) {
+  if (config.upstreamMode !== "codex") return;
+  const rateLimits = extractCodexRateLimits(headers);
+  if (rateLimits) codexUsage.rate_limits = rateLimits;
 }
 
 async function appendRequestLog(entry) {
@@ -1310,19 +1387,28 @@ const FALLBACK_MODELS = [
   { id: "o4-mini", owned_by: "openai" },
 ];
 
-const modelsCache = { data: null, expiresAt: 0 };
-const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
-
 function deriveModelsUrl() {
-  if (config.upstreamModelsUrl) return config.upstreamModelsUrl;
-  const url = new URL(config.upstreamResponsesUrl);
-  url.pathname = url.pathname.replace(/\/responses\/?$/, "/models");
+  const url = new URL(config.upstreamModelsUrl || config.upstreamResponsesUrl);
+  if (!config.upstreamModelsUrl) {
+    url.pathname = url.pathname.replace(/\/responses\/?$/, "/models");
+  }
+  if (
+    config.upstreamMode === "codex" &&
+    config.codexClientVersion &&
+    !url.searchParams.has("client_version")
+  ) {
+    url.searchParams.set("client_version", config.codexClientVersion);
+  }
   return url.toString();
 }
 
 function normalizeUpstreamModels(raw) {
   if (!raw || typeof raw !== "object") return null;
-  const list = Array.isArray(raw) ? raw : raw.data;
+  const list = Array.isArray(raw)
+    ? raw
+    : Array.isArray(raw.data)
+      ? raw.data
+      : raw.models;
   if (!Array.isArray(list)) return null;
   return list
     .map((m) => {
@@ -1354,16 +1440,9 @@ async function fetchUpstreamModels() {
 
 async function handleModels(_req, res) {
   const now = Date.now();
-  if (modelsCache.data && now < modelsCache.expiresAt) {
-    sendJson(res, 200, { object: "list", data: modelsCache.data });
-    return;
-  }
-
   try {
     const upstreamModels = await fetchUpstreamModels();
     if (upstreamModels && upstreamModels.length > 0) {
-      modelsCache.data = upstreamModels;
-      modelsCache.expiresAt = now + MODELS_CACHE_TTL_MS;
       sendJson(res, 200, { object: "list", data: upstreamModels });
       return;
     }
@@ -1379,10 +1458,14 @@ async function handleModels(_req, res) {
 }
 
 function handleUsage(_req, res) {
-  sendJson(res, 200, {
+  const payload = {
     object: "proxy.usage",
     cumulative_usage: { ...cumulativeUsage },
-  });
+  };
+  if (config.upstreamMode === "codex" && codexUsage.rate_limits) {
+    payload.codex = { rate_limits: codexUsage.rate_limits };
+  }
+  sendJson(res, 200, payload);
 }
 
 const server = http.createServer(async (req, res) => {

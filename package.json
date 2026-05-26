@@ -1,7 +1,7 @@
 {
   "name": "chat-completions-to-responses-proxy",
   "version": "0.1.0",
-  "description": "Local compatibility proxy that exposes /v1/chat/completions and forwards to a Responses upstream.",
+  "description": "Local compatibility proxy that exposes /v1/chat/completions, /v1/models, and /v1/usage while forwarding chat requests to a Responses upstream.",
   "main": "chat-completions-to-responses-proxy.js",
   "bin": {
     "chat-completions-to-responses-proxy": "./chat-completions-to-responses-proxy.js"

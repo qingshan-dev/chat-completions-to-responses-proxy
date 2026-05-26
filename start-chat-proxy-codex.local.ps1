@@ -29,6 +29,37 @@ function Get-ProxyPidFromListener($listenerLine) {
   return [int]$parts[$parts.Count - 1]
 }
 
+function Get-CodexClientVersion {
+  if ($env:CODEX_CLIENT_VERSION) {
+    return [string]$env:CODEX_CLIENT_VERSION
+  }
+
+  $modelsCacheFile = Join-Path (Split-Path -Parent $CodexAuthFile) 'models_cache.json'
+  if (Test-Path -LiteralPath $modelsCacheFile) {
+    try {
+      $modelsCache = Get-Content -LiteralPath $modelsCacheFile -Raw | ConvertFrom-Json
+      if ($modelsCache.client_version) {
+        return [string]$modelsCache.client_version
+      }
+    } catch {}
+  }
+
+  $codex = Get-Command codex.cmd -ErrorAction SilentlyContinue
+  if (-not $codex) {
+    $codex = Get-Command codex.exe -ErrorAction SilentlyContinue
+  }
+  if ($codex) {
+    try {
+      $versionText = (& $codex.Source --version 2>$null | Select-Object -First 1)
+      if ([string]$versionText -match '(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)') {
+        return $Matches[1]
+      }
+    } catch {}
+  }
+
+  return ''
+}
+
 if (-not (Test-Path -LiteralPath $ProxyScript)) {
   throw "Proxy script not found: $ProxyScript"
 }
@@ -50,6 +81,8 @@ $CodexClientId = [string]$tokens.id_token
 if ($env:CODEX_CLIENT_ID) {
   $CodexClientId = $env:CODEX_CLIENT_ID
 }
+
+$CodexClientVersion = Get-CodexClientVersion
 
 $LocalApiKey = ''
 if ([string]::IsNullOrEmpty($LocalApiKey) -and $env:LOCAL_API_KEY) {
@@ -78,6 +111,7 @@ if ($listener) {
     health_ok = $health.ok
     upstream_mode = $health.upstream_mode
     auth_file = $CodexAuthFile
+    codex_client_version = $CodexClientVersion
     log_file = $RequestLog
   } | Format-List
   return
@@ -92,6 +126,7 @@ $env:CODEX_ACCESS_TOKEN = [string]$tokens.access_token
 # $env:CODEX_REFRESH_TOKEN = [string]$tokens.refresh_token
 Remove-Item Env:\CODEX_REFRESH_TOKEN -ErrorAction SilentlyContinue
 $env:CODEX_ACCOUNT_ID = [string]$tokens.account_id
+$env:CODEX_CLIENT_VERSION = $CodexClientVersion
 $env:CODEX_STRICT = '1'
 $env:LOG_FILE = $RequestLog
 $env:RAW_LOG_FILE = $RawLog
@@ -107,6 +142,7 @@ $psi.WorkingDirectory = $WorkDir
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 $psi.Environment['CODEX_CLIENT_ID'] = $CodexClientId
+$psi.Environment['CODEX_CLIENT_VERSION'] = $CodexClientVersion
 $psi.Environment['LOCAL_API_KEY'] = $LocalApiKey
 
 $process = [System.Diagnostics.Process]::Start($psi)
@@ -144,6 +180,7 @@ $listener = Get-ProxyListener
   health_ok = $health.ok
   upstream_mode = $health.upstream_mode
   auth_file = $CodexAuthFile
+  codex_client_version = $CodexClientVersion
   proxy_url = if ($ProxyUrl) { $ProxyUrl } else { '' }
   log_file = $RequestLog
   raw_log_file = $RawLog
