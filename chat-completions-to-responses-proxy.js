@@ -19,6 +19,7 @@ const config = {
     process.env.UPSTREAM_RESPONSES_URL ||
     "https://chatgpt.com/backend-api/codex/responses",
   upstreamApiKey: process.env.UPSTREAM_API_KEY || "",
+  upstreamModelsUrl: process.env.UPSTREAM_MODELS_URL || "",
   codexAccessToken: process.env.CODEX_ACCESS_TOKEN || "",
   codexRefreshToken: process.env.CODEX_REFRESH_TOKEN || "",
   codexAccountId: process.env.CODEX_ACCOUNT_ID || "",
@@ -1298,6 +1299,92 @@ function authorizeLocal(req, res) {
   return false;
 }
 
+const FALLBACK_MODELS = [
+  { id: "gpt-4o", owned_by: "openai" },
+  { id: "gpt-4o-mini", owned_by: "openai" },
+  { id: "gpt-4-turbo", owned_by: "openai" },
+  { id: "gpt-4", owned_by: "openai" },
+  { id: "gpt-3.5-turbo", owned_by: "openai" },
+  { id: "o3", owned_by: "openai" },
+  { id: "o3-mini", owned_by: "openai" },
+  { id: "o4-mini", owned_by: "openai" },
+];
+
+const modelsCache = { data: null, expiresAt: 0 };
+const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
+
+function deriveModelsUrl() {
+  if (config.upstreamModelsUrl) return config.upstreamModelsUrl;
+  const url = new URL(config.upstreamResponsesUrl);
+  url.pathname = url.pathname.replace(/\/responses\/?$/, "/models");
+  return url.toString();
+}
+
+function normalizeUpstreamModels(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const list = Array.isArray(raw) ? raw : raw.data;
+  if (!Array.isArray(list)) return null;
+  return list
+    .map((m) => {
+      if (!m || typeof m !== "object") return null;
+      const id = m.id || m.slug || m.model || m.name;
+      if (!id) return null;
+      return {
+        id,
+        object: "model",
+        created: m.created || Math.floor(Date.now() / 1000),
+        owned_by: m.owned_by || m.ownedBy || "openai",
+      };
+    })
+    .filter(Boolean);
+}
+
+async function fetchUpstreamModels() {
+  const modelsUrl = deriveModelsUrl();
+  const headers = await buildUpstreamHeaders();
+  const res = await requestRaw(modelsUrl, {
+    method: "GET",
+    headers: { ...headers, Accept: "application/json" },
+  });
+  const text = await streamToString(res);
+  if (res.statusCode < 200 || res.statusCode >= 300) return null;
+  const parsed = JSON.parse(text);
+  return normalizeUpstreamModels(parsed);
+}
+
+async function handleModels(_req, res) {
+  const now = Date.now();
+  if (modelsCache.data && now < modelsCache.expiresAt) {
+    sendJson(res, 200, { object: "list", data: modelsCache.data });
+    return;
+  }
+
+  try {
+    const upstreamModels = await fetchUpstreamModels();
+    if (upstreamModels && upstreamModels.length > 0) {
+      modelsCache.data = upstreamModels;
+      modelsCache.expiresAt = now + MODELS_CACHE_TTL_MS;
+      sendJson(res, 200, { object: "list", data: upstreamModels });
+      return;
+    }
+  } catch {}
+
+  const fallback = FALLBACK_MODELS.map((m) => ({
+    id: m.id,
+    object: "model",
+    created: Math.floor(now / 1000),
+    owned_by: m.owned_by,
+  }));
+  sendJson(res, 200, { object: "list", data: fallback });
+}
+
+function handleUsage(_req, res) {
+  sendJson(res, 200, {
+    object: "proxy.usage",
+    cumulative_usage: { ...cumulativeUsage },
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
@@ -1307,6 +1394,16 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (!authorizeLocal(req, res)) return;
+
+    if (req.method === "GET" && url.pathname === "/v1/models") {
+      await handleModels(req, res);
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/usage") {
+      handleUsage(req, res);
+      return;
+    }
 
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
       await handleChatCompletions(req, res);
